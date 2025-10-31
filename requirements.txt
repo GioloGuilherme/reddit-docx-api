@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+praw
+python-docx
+requests
+python-multipart
+typing_extensions
