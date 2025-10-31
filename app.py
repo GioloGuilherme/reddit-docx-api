@@ -29,6 +29,7 @@ python‑docx to generate documents.
 """
 
 import os
+import threading
 import time
 import uuid
 import shutil
@@ -51,6 +52,13 @@ from urllib.parse import urlparse, parse_qs
 # so you may wish to periodically prune this directory in production.
 BASE_JOBS_DIR = os.environ.get("JOBS_DIR", "./jobs")
 DELAY_SECONDS = int(os.environ.get("DELAY_SECONDS", "30"))  # throttle between Reddit calls
+
+# In‑memory store for job metadata. Each job_id key maps to a dict
+# tracking the current status, total number of URLs, a list of per‑URL
+# results, and the relative ZIP download path once available. In a
+# production environment, you would likely persist this to a database
+# or use a proper task queue.
+jobs: dict[str, dict] = {}
 
 os.makedirs(BASE_JOBS_DIR, exist_ok=True)
 
@@ -233,7 +241,7 @@ def zip_folder(folder_path: str, zip_path: str) -> None:
                     zf.write(full, arcname=os.path.basename(full))
 
 
-@app.post("/process")
+@app.post("/api/process")
 async def process_threads(
     client_id: str = Form(...),
     client_secret: str = Form(...),
@@ -256,80 +264,107 @@ async def process_threads(
     total = len(url_list)
     if total == 0:
         raise HTTPException(status_code=400, detail="No URLs found in uploaded file.")
-    # Create a unique folder for this job
+    # Create a job ID and job directory
     job_id = str(uuid.uuid4())
     job_dir = os.path.join(BASE_JOBS_DIR, job_id)
     os.makedirs(job_dir, exist_ok=True)
-    # Authenticate to Reddit
-    try:
-        reddit = authenticate_reddit(client_id, client_secret, user_agent)
-        # Trigger a minimal request to validate credentials
-        next(reddit.subreddit("all").hot(limit=1))
-    except Exception as e:
-        shutil.rmtree(job_dir, ignore_errors=True)
-        raise HTTPException(status_code=401, detail=f"Reddit authentication failed: {e}")
-    # Process each URL
-    results: List[dict] = []
-    for i, url in enumerate(url_list, start=1):
-        try:
-            (
-                tt,
-                tb,
-                tu,
-                comments,
-                media,
-                post_date,
-                sid,
-            ) = get_reddit_thread_data(reddit, url)
-            filename = generate_docx(
-                url,
-                tt,
-                tb,
-                tu,
-                comments,
-                media,
-                post_date,
-                job_dir,
-                sid,
-            )
-            results.append(
-                {
-                    "url": url,
-                    "status": "success",
-                    "filename": filename,
-                    "error": None,
-                    "index": i,
-                    "total": total,
-                }
-            )
-        except Exception as e:
-            results.append(
-                {
-                    "url": url,
-                    "status": "error",
-                    "filename": None,
-                    "error": str(e),
-                    "index": i,
-                    "total": total,
-                }
-            )
-        # Enforce delay between requests, except after the last URL
-        if i < total:
-            time.sleep(DELAY_SECONDS)
-    # Create ZIP file
-    zip_filename = f"{job_id}.zip"
-    zip_path = os.path.join(job_dir, zip_filename)
-    zip_folder(job_dir, zip_path)
-    # Provide relative download URL
-    return {
-        "job_id": job_id,
+    # Initialize job state
+    jobs[job_id] = {
+        "status": "pending",
         "total": total,
-        "results": results,
-        "zip_url": f"/download/{job_id}",
+        "completed": 0,
+        "results": [
+            {"url": url, "status": "pending", "filename": None, "error": None}
+            for url in url_list
+        ],
+        "zip_url": None,
     }
 
+    def process_job():
+        """
+        Worker function to process a list of URLs into DOCX files and a ZIP
+        archive. Updates the global `jobs` dict as it progresses.
+        """
+        try:
+            # Authenticate to Reddit once at the start
+            try:
+                reddit = authenticate_reddit(client_id, client_secret, user_agent)
+                # Validate credentials with a lightweight request
+                next(reddit.subreddit("all").hot(limit=1))
+            except Exception as e:
+                # Mark entire job as failed if authentication fails
+                jobs[job_id]["status"] = "error"
+                for entry in jobs[job_id]["results"]:
+                    entry["status"] = "error"
+                    entry["error"] = f"Reddit authentication failed: {e}"
+                return
+            # Start processing
+            jobs[job_id]["status"] = "processing"
+            for i, url in enumerate(url_list):
+                try:
+                    (
+                        tt,
+                        tb,
+                        tu,
+                        comments,
+                        media,
+                        post_date,
+                        sid,
+                    ) = get_reddit_thread_data(reddit, url)
+                    filename = generate_docx(
+                        url,
+                        tt,
+                        tb,
+                        tu,
+                        comments,
+                        media,
+                        post_date,
+                        job_dir,
+                        sid,
+                    )
+                    jobs[job_id]["results"][i].update(
+                        {
+                            "status": "success",
+                            "filename": filename,
+                            "error": None,
+                        }
+                    )
+                except Exception as e:
+                    jobs[job_id]["results"][i].update(
+                        {
+                            "status": "error",
+                            "filename": None,
+                            "error": str(e),
+                        }
+                    )
+                # Update completion count
+                jobs[job_id]["completed"] = i + 1
+                # Delay between requests except after last one
+                if i < total - 1:
+                    time.sleep(DELAY_SECONDS)
+            # Create ZIP file
+            zip_filename = f"{job_id}.zip"
+            zip_path = os.path.join(job_dir, zip_filename)
+            zip_folder(job_dir, zip_path)
+            jobs[job_id]["zip_url"] = f"/api/download/{job_id}"
+            jobs[job_id]["status"] = "completed"
+        except Exception as e:
+            jobs[job_id]["status"] = "error"
+            # Propagate error to all result entries that haven't been marked
+            for entry in jobs[job_id]["results"]:
+                if entry["status"] == "pending":
+                    entry["status"] = "error"
+                    entry["error"] = str(e)
+            jobs[job_id]["zip_url"] = None
 
-@app.get("/download/{job_id}")
+    # Start background thread
+    thread = threading.Thread(target=process_job, daemon=True)
+    thread.start()
+
+    return {"job_id": job_id}
+
+
+@app.get("/api/download/{job_id}")
 async def download_zip(job_id: str):
     """Serve the ZIP archive for a given job ID."""
     zip_file = os.path.join(BASE_JOBS_DIR, job_id, f"{job_id}.zip")
@@ -340,3 +375,19 @@ async def download_zip(job_id: str):
         media_type="application/zip",
         filename=f"{job_id}.zip",
     )
+
+
+# -----------------------------------------------------------------------------
+# Job status endpoint
+#
+# Allows clients to poll for the progress of a given job. Returns the job's
+# current status, total number of URLs, how many have completed, per‑URL
+# results, and the relative download path once available. Returns 404 if
+# the job ID is unknown.
+
+@app.get("/api/status/{job_id}")
+async def get_status(job_id: str):
+    job = jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return job
